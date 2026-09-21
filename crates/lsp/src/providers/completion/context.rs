@@ -248,19 +248,32 @@ fn check_if_in_posting_area(
                         || first_word.chars().next().is_some_and(|c| c.is_uppercase()));
 
                 if has_account {
-                    // If there's more than one word, we might have account + amount/currency
-                    if words.len() > 1 {
-                        // Check if we're at the second word position (amount) or third+ (currency)
-                        // Second word: amount, Third+ word: currency
-                        if words.len() >= 3 {
-                            return CompletionContext::PostingCurrency;
-                        } else {
-                            return CompletionContext::PostingAmount;
+                    // Decide account vs. amount vs. currency from the text *before
+                    // the cursor* and whether the account token has been "finished"
+                    // with whitespace. Counting whole-line words is wrong: a line
+                    // like "Expenses:Food  " (one word, trailing spaces) means the
+                    // user is in the amount slot, not still typing the account.
+                    let prefix_to_cursor: String =
+                        current_line_str.chars().take(cursor.column).collect();
+                    let tokens_before: Vec<&str> = prefix_to_cursor.split_whitespace().collect();
+                    let trailing_ws = prefix_to_cursor.ends_with(|c: char| c.is_whitespace());
+
+                    match tokens_before.len() {
+                        // Still typing the account name (no separating space yet).
+                        0 => {
+                            let prefix = extract_account_prefix(&current_line_str, cursor.column);
+                            return CompletionContext::PostingAccount { prefix };
                         }
-                    } else {
-                        // Only one word - still typing the account
-                        let prefix = extract_account_prefix(&current_line_str, cursor.column);
-                        return CompletionContext::PostingAccount { prefix };
+                        1 if !trailing_ws => {
+                            let prefix = extract_account_prefix(&current_line_str, cursor.column);
+                            return CompletionContext::PostingAccount { prefix };
+                        }
+                        // Account finished with a space => amount slot.
+                        1 => return CompletionContext::PostingAmount,
+                        // Account + a number being typed => still the amount; once
+                        // that number is finished with a space, the currency is next.
+                        2 if !trailing_ws => return CompletionContext::PostingAmount,
+                        _ => return CompletionContext::PostingCurrency,
                     }
                 } else {
                     let prefix = extract_account_prefix(&current_line_str, cursor.column);
@@ -327,6 +340,22 @@ fn analyze_transaction_context(
                         CompletionContext::AfterPayee // Can happen with incomplete line
                     } else {
                         // On a new line, we're in posting area
+                        let line = content.line(cursor.row).to_string();
+                        let prefix = extract_account_prefix(&line, cursor.column);
+                        CompletionContext::PostingAccount { prefix }
+                    }
+                }
+                "posting" => {
+                    // The cursor's previous sibling is a posting. If the cursor is
+                    // on that same line, it sits *within* the posting (e.g. in the
+                    // amount slot after the account) — delegate so we get
+                    // PostingAmount/PostingCurrency rather than defaulting to an
+                    // account. Trailing whitespace after the account lands here
+                    // because it is outside the posting node itself.
+                    if cursor.row == prev.start_position().row {
+                        analyze_posting_context(prev, cursor, content)
+                    } else {
+                        // A fresh line below the previous posting => new posting.
                         let line = content.line(cursor.row).to_string();
                         let prefix = extract_account_prefix(&line, cursor.column);
                         CompletionContext::PostingAccount { prefix }
@@ -739,6 +768,74 @@ mod tests {
             }
             _ => panic!("Expected PostingAccount context, got {:?}", context),
         }
+    }
+
+    #[test]
+    fn test_determine_context_amount_slot_after_account() {
+        use ropey::Rope;
+        use tree_sitter::Parser;
+
+        // Real-world path: a well-formed transaction where the cursor sits in the
+        // amount slot (after the account + spaces) of a second posting. tree-sitter
+        // produces a valid `posting` node here, so this exercises the
+        // analyze_transaction_context / analyze_posting_context dispatch rather
+        // than the textual fallback. Regression: this used to resolve to
+        // PostingAccount (a previous-sibling `posting` fell through to the default
+        // arm) and dumped account names where the amount belongs.
+        let text =
+            "2026-05-24 * \"Test\" \"amt\"\n  Assets:Checking  -100.00 USD\n  Expenses:Food  \n";
+        let rope = Rope::from_str(text);
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_beancount::language())
+            .unwrap();
+        let tree = parser.parse(text, None).unwrap();
+
+        let cursor = Point { row: 2, column: 17 };
+        let ctx = determine_completion_context(&tree, &rope, cursor, None);
+        assert!(
+            matches!(ctx, CompletionContext::PostingAmount),
+            "Expected PostingAmount, got {:?}",
+            ctx
+        );
+    }
+
+    #[test]
+    fn test_check_if_in_posting_area_amount_slot() {
+        use ropey::Rope;
+        use tree_sitter::Parser;
+
+        // Account finished with trailing whitespace => we're in the amount slot,
+        // not still completing the account (the old word-count heuristic got this
+        // wrong and returned account completions here).
+        let text = "2026-01-06 * \"payee\" \"narration\"\n  Expenses:Food  ";
+        let rope = Rope::from_str(text);
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_beancount::language())
+            .unwrap();
+        let tree = parser.parse(text, None).unwrap();
+
+        // Cursor at end of "  Expenses:Food  " (after the two trailing spaces).
+        let cursor = Point { row: 1, column: 17 };
+        let context = check_if_in_posting_area(&tree, &rope, cursor);
+        assert!(
+            matches!(context, CompletionContext::PostingAmount),
+            "Expected PostingAmount, got {:?}",
+            context
+        );
+
+        // After a completed number + space => currency slot.
+        let text2 = "2026-01-06 * \"payee\" \"narration\"\n  Expenses:Food  100.00 ";
+        let rope2 = Rope::from_str(text2);
+        let tree2 = parser.parse(text2, None).unwrap();
+        let cursor2 = Point { row: 1, column: 24 };
+        let context2 = check_if_in_posting_area(&tree2, &rope2, cursor2);
+        assert!(
+            matches!(context2, CompletionContext::PostingCurrency),
+            "Expected PostingCurrency, got {:?}",
+            context2
+        );
     }
 
     #[test]
