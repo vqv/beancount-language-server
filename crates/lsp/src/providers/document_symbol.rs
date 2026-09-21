@@ -1,3 +1,4 @@
+use crate::config::DocumentSymbolDetail;
 use crate::server::LspServerStateSnapshot;
 use crate::treesitter_utils::text_for_tree_sitter_node;
 use anyhow::Result;
@@ -11,6 +12,12 @@ pub(crate) fn document_symbols(
     snapshot: LspServerStateSnapshot,
     params: DocumentSymbolParams,
 ) -> Result<Option<DocumentSymbolResponse>> {
+    let detail = snapshot.config.document_symbols;
+    // Defer entirely to other providers (e.g. an org-mode outline) when off.
+    if detail == DocumentSymbolDetail::Off {
+        return Ok(Some(Vec::<DocumentSymbol>::new().into()));
+    }
+
     let uri = match params.text_document.uri.to_file_path() {
         Ok(path) => path,
         Err(_) => {
@@ -41,7 +48,7 @@ pub(crate) fn document_symbols(
     let mut cursor = root_node.walk();
 
     for child in root_node.children(&mut cursor) {
-        if let Some(symbol) = extract_symbol(&child, &content) {
+        if let Some(symbol) = extract_symbol(&child, &content, detail) {
             symbols.push(symbol);
         }
     }
@@ -50,10 +57,26 @@ pub(crate) fn document_symbols(
     Ok(Some(symbols.into()))
 }
 
-/// Extract a DocumentSymbol from a tree-sitter node.
-fn extract_symbol(node: &Node, content: &Rope) -> Option<DocumentSymbol> {
+/// Extract a DocumentSymbol from a tree-sitter node, honoring the configured
+/// detail level.
+fn extract_symbol(
+    node: &Node,
+    content: &Rope,
+    detail: DocumentSymbolDetail,
+) -> Option<DocumentSymbol> {
     match node.kind() {
-        "transaction" => extract_transaction_symbol(node, content),
+        "transaction" => {
+            // Skip transactions (and therefore postings) entirely in directives/off mode.
+            if matches!(
+                detail,
+                DocumentSymbolDetail::Directives | DocumentSymbolDetail::Off
+            ) {
+                None
+            } else {
+                let include_postings = detail == DocumentSymbolDetail::Full;
+                extract_transaction_symbol(node, content, include_postings)
+            }
+        }
         "open" => extract_open_symbol(node, content),
         "close" => extract_close_symbol(node, content),
         "balance" => extract_balance_symbol(node, content),
@@ -62,13 +85,17 @@ fn extract_symbol(node: &Node, content: &Rope) -> Option<DocumentSymbol> {
         "event" => extract_event_symbol(node, content),
         "option" => extract_option_symbol(node, content),
         "comment" => extract_heading_symbol(node, content),
-        "section" => extract_section_symbol(node, content),
+        "section" => extract_section_symbol(node, content, detail),
         _ => None,
     }
 }
 
 /// Extract transaction symbol with postings as children.
-fn extract_transaction_symbol(node: &Node, content: &Rope) -> Option<DocumentSymbol> {
+fn extract_transaction_symbol(
+    node: &Node,
+    content: &Rope,
+    include_postings: bool,
+) -> Option<DocumentSymbol> {
     let mut cursor = node.walk();
     let mut date = String::new();
     let mut flag = String::new();
@@ -90,7 +117,7 @@ fn extract_transaction_symbol(node: &Node, content: &Rope) -> Option<DocumentSym
             "narration" => {
                 narration = text_for_tree_sitter_node(content, &child);
             }
-            "posting" => {
+            "posting" if include_postings => {
                 if let Some(posting_symbol) = extract_posting_symbol(&child, content) {
                     postings.push(posting_symbol);
                 }
@@ -398,7 +425,11 @@ fn extract_option_symbol(node: &Node, content: &Rope) -> Option<DocumentSymbol> 
 /// Extract section symbol (org-mode and markdown sections parsed by tree-sitter-beancount).
 /// Sections are hierarchical with "headline" and nested "section" children.
 /// Supports both org-mode (* headers) and markdown (# headers).
-fn extract_section_symbol(node: &Node, content: &Rope) -> Option<DocumentSymbol> {
+fn extract_section_symbol(
+    node: &Node,
+    content: &Rope,
+    detail: DocumentSymbolDetail,
+) -> Option<DocumentSymbol> {
     let mut cursor = node.walk();
     let mut headline_text = String::new();
     let mut level = 0;
@@ -430,13 +461,13 @@ fn extract_section_symbol(node: &Node, content: &Rope) -> Option<DocumentSymbol>
             }
             "section" => {
                 // Recursively extract nested sections as children
-                if let Some(child_symbol) = extract_section_symbol(&child, content) {
+                if let Some(child_symbol) = extract_section_symbol(&child, content, detail) {
                     children.push(child_symbol);
                 }
             }
             _ => {
                 // Extract other directives (open, transaction, etc.) as children
-                if let Some(child_symbol) = extract_symbol(&child, content) {
+                if let Some(child_symbol) = extract_symbol(&child, content, detail) {
                     children.push(child_symbol);
                 }
             }
@@ -617,6 +648,45 @@ mod tests {
         } else {
             panic!("Expected nested document symbols");
         }
+    }
+
+    #[test]
+    fn test_document_symbol_detail_levels() {
+        let content = "2024-01-01 open Assets:Checking USD\n\n2024-01-15 * \"Store\" \"x\"\n  Expenses:Food   45.23 USD\n  Assets:Checking  -45.23 USD\n";
+
+        let run = |detail: DocumentSymbolDetail| -> Vec<DocumentSymbol> {
+            let mut state = TestState::new(content).unwrap();
+            state.snapshot.config.document_symbols = detail;
+            let uri = lsp_types::Uri::from_str(Url::from_file_path(&state.path).unwrap().as_ref())
+                .unwrap();
+            let params = DocumentSymbolParams {
+                text_document: lsp_types::TextDocumentIdentifier { uri },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            };
+            match document_symbols(state.snapshot, params).unwrap() {
+                Some(DocumentSymbolResponse::DocumentSymbolList(s)) => s,
+                other => panic!("unexpected response: {:?}", other),
+            }
+        };
+
+        // Full: open + transaction, transaction carries its 2 postings as children.
+        let full = run(DocumentSymbolDetail::Full);
+        let txn = full.iter().find(|s| s.kind == SymbolKind::Struct).unwrap();
+        assert_eq!(txn.children.as_ref().map(|c| c.len()), Some(2));
+
+        // Transactions: transaction present but no posting children.
+        let txns = run(DocumentSymbolDetail::Transactions);
+        let txn = txns.iter().find(|s| s.kind == SymbolKind::Struct).unwrap();
+        assert!(txn.children.is_none());
+
+        // Directives: directives kept, transactions (and postings) dropped.
+        let dir = run(DocumentSymbolDetail::Directives);
+        assert!(dir.iter().any(|s| s.kind == SymbolKind::File)); // the open
+        assert!(!dir.iter().any(|s| s.kind == SymbolKind::Struct)); // no transaction
+
+        // Off: no symbols at all.
+        assert!(run(DocumentSymbolDetail::Off).is_empty());
     }
 
     #[test]

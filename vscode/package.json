@@ -151,6 +151,28 @@
             }
           }
         },
+        "beancountLangServer.diagnosticFlags": {
+          "scope": "resource",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": ["!"],
+          "description": "List of transaction flags that should generate warning diagnostics (e.g., [\"!\", \"P\"]). Set to [] to disable."
+        },
+        "beancountLangServer.documentSymbols": {
+          "scope": "resource",
+          "type": "string",
+          "enum": ["full", "transactions", "directives", "off"],
+          "enumDescriptions": [
+            "Transactions with postings as children, plus directives and section headings.",
+            "Transactions (no posting children), plus directives and section headings.",
+            "Directives and section headings only; no transactions or postings.",
+            "No document symbols (defer to another provider, e.g. an org-mode outline)."
+          ],
+          "default": "full",
+          "description": "Granularity of document symbols (Go to Symbol / Outline)."
+        },
         "beancountLangServer.serverPath": {
           "scope": "resource",
           "type": "string",

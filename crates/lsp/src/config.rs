@@ -15,6 +15,39 @@ pub struct Config {
     pub bean_check: BeancountCheckConfig,
     /// Flags that should generate diagnostics (e.g., ["!"] for only exclamation mark)
     pub diagnostic_flags: Vec<String>,
+    /// How much detail `textDocument/documentSymbol` should produce.
+    pub document_symbols: DocumentSymbolDetail,
+}
+
+/// Granularity of the document-symbol outline (Cmd+R / Outline view).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DocumentSymbolDetail {
+    /// Transactions with their postings as children, plus all directives and
+    /// section headings.
+    #[default]
+    Full,
+    /// Transactions (no posting children), plus directives and section headings.
+    Transactions,
+    /// Directives (open/close/balance/price/commodity/event/option) and section
+    /// headings only — no transactions or postings.
+    Directives,
+    /// Emit no document symbols at all. Useful when another extension already
+    /// provides the outline (e.g. org-mode section headers).
+    Off,
+}
+
+impl std::str::FromStr for DocumentSymbolDetail {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "full" => Ok(Self::Full),
+            "transactions" => Ok(Self::Transactions),
+            "directives" => Ok(Self::Directives),
+            "off" => Ok(Self::Off),
+            _ => Err(format!("invalid documentSymbols value: {:?}", s)),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -82,6 +115,7 @@ impl Config {
             completion: CompletionConfig::default(),
             bean_check: BeancountCheckConfig::new(),
             diagnostic_flags: vec!["!".to_string()],
+            document_symbols: DocumentSymbolDetail::default(),
         }
     }
     pub fn update(&mut self, json: serde_json::Value) -> Result<()> {
@@ -158,6 +192,14 @@ impl Config {
             self.diagnostic_flags = diagnostic_flags;
         }
 
+        // Update document-symbol detail level
+        if let Some(level) = beancount_lsp_settings.document_symbols {
+            match level.parse::<DocumentSymbolDetail>() {
+                Ok(detail) => self.document_symbols = detail,
+                Err(e) => tracing::warn!("Ignoring invalid documentSymbols setting: {}", e),
+            }
+        }
+
         Ok(())
     }
 }
@@ -170,6 +212,8 @@ pub struct BeancountLspOptions {
     pub bean_check: Option<BeancountCheckOptions>,
     /// Flags that should generate diagnostics (e.g., ["!"] for only exclamation mark)
     pub diagnostic_flags: Option<Vec<String>>,
+    /// Document-symbol detail: "full" | "transactions" | "directives" | "off".
+    pub document_symbols: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
