@@ -44,6 +44,7 @@ pub(crate) fn completion(
         content,
         cursor.position,
         &snapshot.config,
+        tree,
     )?;
 
     Ok(items.map(|items| {
