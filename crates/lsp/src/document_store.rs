@@ -263,12 +263,38 @@ impl DocumentStore {
         // forest, beancount_data, and parsers intentionally kept for non-open file tracking
     }
 
+    /// True when `uri` is open in the editor, meaning a tree parsed from the file
+    /// on disk must not be stored for it.
+    ///
+    /// `open()` and `apply_change()` keep `forest[uri]`, `beancount_data[uri]` and
+    /// `open_docs[uri].content` describing the same text, and every provider pairs
+    /// the forest tree with the open buffer's rope. A disk parse of a file with
+    /// unsaved edits describes different text, so letting one land here hands
+    /// providers node byte offsets that do not exist in the rope — which panicked
+    /// `text_for_tree_sitter_node` with "Byte index out of bounds" and, on the main
+    /// thread, took the server down. `did_change_watched_files` has always skipped
+    /// open files; the forest initialiser and include walker now do the same.
+    fn skip_if_open(&self, uri: &PathBuf, caller: &str) -> bool {
+        if self.open_docs.contains_key(uri) {
+            tracing::debug!("{caller}: skipping {uri:?} - file is open in editor");
+            return true;
+        }
+        false
+    }
+
     /// Insert a freshly parsed external file (includes, watched-file reloads).
     ///
     /// Wraps the tree in `Arc`, creates `BeancountData`, stores both, and stores
     /// the rope in `forest_content` for text-level access by providers.
     /// Does not touch `open_docs` or `parsers`.
+    ///
+    /// Ignored for a file that is open in the editor: the buffer, not the file on
+    /// disk, is that file's content, and providers pair `forest[uri]` with
+    /// `open_docs[uri]`. See [`DocumentStore::skip_if_open`].
     pub(crate) fn insert_parsed(&mut self, uri: PathBuf, tree: tree_sitter::Tree, content: &str) {
+        if self.skip_if_open(&uri, "insert_parsed") {
+            return;
+        }
         let tree_arc = Arc::new(tree);
         let rope = Rope::from_str(content);
         let beancount_data = BeancountData::new(&tree_arc, &rope);
@@ -278,6 +304,8 @@ impl DocumentStore {
     }
 
     /// Insert pre-computed `Arc`-wrapped tree, data, and rope (used by the ForestInit background task).
+    ///
+    /// Ignored for a file that is open in the editor — see [`DocumentStore::insert_parsed`].
     pub(crate) fn insert_tree_and_data(
         &mut self,
         uri: PathBuf,
@@ -285,6 +313,9 @@ impl DocumentStore {
         data: Arc<BeancountData>,
         rope: Arc<Rope>,
     ) {
+        if self.skip_if_open(&uri, "insert_tree_and_data") {
+            return;
+        }
         Arc::make_mut(&mut self.forest).insert(uri.clone(), tree);
         Arc::make_mut(&mut self.beancount_data).insert(uri.clone(), data);
         Arc::make_mut(&mut self.forest_content).insert(uri, rope);
@@ -563,6 +594,62 @@ mod tests {
         assert!(store.get_tree(&uri).is_some());
         assert!(store.beancount_data.contains_key(&uri));
         assert!(store.forest_content.contains_key(&uri));
+    }
+
+    /// The file on disk is longer than the editor's unsaved buffer, so a tree
+    /// parsed from disk has nodes past the end of the buffer's rope. Providers
+    /// pair `forest[uri]` with `open_docs[uri].content`, so storing that tree
+    /// panicked `text_for_tree_sitter_node` with "Byte index out of bounds".
+    const DISK_CONTENT: &str = concat!(
+        "2024-01-01 open Assets:Checking USD\n",
+        "2024-01-02 * \"a payee\" \"a narration that only exists on disk\"\n",
+        "  Assets:Checking   -1.00 USD\n",
+        "  Expenses:Food      1.00 USD\n",
+    );
+
+    fn assert_tree_fits_buffer(store: &DocumentStore, uri: &PathBuf) {
+        let tree = store.get_tree(uri).expect("tree should exist");
+        let content = &store
+            .open_docs
+            .get(uri)
+            .expect("doc should be open")
+            .content;
+        assert!(
+            tree.root_node().end_byte() <= content.len_bytes(),
+            "tree spans {} bytes but the open buffer holds {}",
+            tree.root_node().end_byte(),
+            content.len_bytes(),
+        );
+        // Would panic on a mismatch before the range was clamped.
+        crate::treesitter_utils::text_for_tree_sitter_node(content, &tree.root_node());
+    }
+
+    #[test]
+    fn test_insert_parsed_does_not_clobber_an_open_doc() {
+        let mut store = DocumentStore::new();
+        let uri = PathBuf::from("/test/open.beancount");
+        store.open(uri.clone(), CONTENT, 1);
+
+        store.insert_parsed(uri.clone(), parse(DISK_CONTENT), DISK_CONTENT);
+
+        assert_tree_fits_buffer(&store, &uri);
+        // open_docs stays the source of truth for an open file
+        assert!(!store.forest_content.contains_key(&uri));
+    }
+
+    #[test]
+    fn test_insert_tree_and_data_does_not_clobber_an_open_doc() {
+        let mut store = DocumentStore::new();
+        let uri = PathBuf::from("/test/open.beancount");
+        store.open(uri.clone(), CONTENT, 1);
+
+        let tree = Arc::new(parse(DISK_CONTENT));
+        let rope = ropey::Rope::from_str(DISK_CONTENT);
+        let data = Arc::new(BeancountData::new(&tree, &rope));
+        store.insert_tree_and_data(uri.clone(), tree, data, Arc::new(rope));
+
+        assert_tree_fits_buffer(&store, &uri);
+        assert!(!store.forest_content.contains_key(&uri));
     }
 
     #[test]
