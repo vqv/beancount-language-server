@@ -145,6 +145,46 @@ pub(crate) fn transaction_inlay_hints(
     process_transaction(txn_node, content)
 }
 
+/// Compute the balancing amount(s) for a transaction: the negation of the sum
+/// of all *explicit* posting amounts, grouped by currency (price/cost converted
+/// to their target currency). Returns one `(value, currency)` entry per currency
+/// with a non-zero residual, sorted by currency. Empty when nothing can be
+/// inferred (e.g. no posting carries an amount yet).
+///
+/// This is the same value surfaced as the balancing inlay hint; completion reuses
+/// it so the suggested amount always matches the hint shown inline.
+pub(crate) fn balancing_amounts(
+    txn_node: &tree_sitter::Node,
+    content: &ropey::Rope,
+) -> Vec<(rust_decimal::Decimal, String)> {
+    let Some(postings) = extract_postings(txn_node, content) else {
+        return Vec::new();
+    };
+
+    let mut totals: HashMap<String, rust_decimal::Decimal> = HashMap::new();
+    for posting in &postings {
+        if let Some(posting_amount) = &posting.amount {
+            if let Some((value, currency)) = posting_amount.convert_to_currency() {
+                *totals
+                    .entry(currency)
+                    .or_insert(rust_decimal::Decimal::ZERO) += value;
+            } else {
+                *totals
+                    .entry(posting_amount.amount.currency.clone())
+                    .or_insert(rust_decimal::Decimal::ZERO) += posting_amount.amount.value;
+            }
+        }
+    }
+
+    let mut amounts: Vec<(rust_decimal::Decimal, String)> = totals
+        .into_iter()
+        .filter(|(_, value)| !value.is_zero())
+        .map(|(currency, value)| (-value, currency))
+        .collect();
+    amounts.sort_by(|a, b| a.1.cmp(&b.1));
+    amounts
+}
+
 /// Process a single transaction and return hints
 fn process_transaction(
     txn_node: &tree_sitter::Node,

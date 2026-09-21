@@ -10,6 +10,7 @@ use nucleo::{
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use tree_sitter_beancount::tree_sitter;
 
 // ============================================================================
 // COMPLETION GENERATION - LSP 3.17 Compliant
@@ -22,6 +23,7 @@ pub(super) fn generate_completions(
     content: &ropey::Rope,
     position: Position,
     config: &crate::config::Config,
+    tree: &tree_sitter::Tree,
 ) -> Result<Option<Vec<CompletionItem>>> {
     match context {
         CompletionContext::DocumentRoot => {
@@ -48,7 +50,7 @@ pub(super) fn generate_completions(
             config.completion.fuzzy_match_accounts,
         )?)),
 
-        CompletionContext::PostingAmount => Ok(Some(complete_amount()?)),
+        CompletionContext::PostingAmount => Ok(Some(complete_amount(tree, content, position)?)),
 
         CompletionContext::PostingCurrency => Ok(Some(complete_currency(data, content, position)?)),
 
@@ -325,9 +327,112 @@ fn complete_currency(
         .collect())
 }
 
-/// Complete amount suggestions
-fn complete_amount() -> Result<Vec<CompletionItem>> {
-    Ok(vec![])
+/// Complete amount suggestions: offer the balancing amount(s) for the enclosing
+/// transaction — the negation of the sum of the other postings, one item per
+/// currency that does not yet balance. This mirrors the balancing inlay hint.
+fn complete_amount(
+    tree: &tree_sitter::Tree,
+    content: &ropey::Rope,
+    position: Position,
+) -> Result<Vec<CompletionItem>> {
+    let point = tree_sitter::Point {
+        row: position.line as usize,
+        column: position.character as usize,
+    };
+    let Some(txn_node) = enclosing_transaction(tree, point) else {
+        return Ok(vec![]);
+    };
+
+    let balances = crate::providers::inlay_hints::balancing_amounts(&txn_node, content);
+    if balances.is_empty() {
+        return Ok(vec![]);
+    }
+
+    // Replace any partial number already typed before the cursor. When the cursor
+    // sits in fresh whitespace this is an empty range, i.e. a plain insert.
+    let line = content.line(position.line as usize).to_string();
+    let replace_range = current_amount_range(&line, position);
+
+    let items = balances
+        .into_iter()
+        .map(|(value, currency)| {
+            let text = format!("{} {}", value, currency);
+            CompletionItem {
+                label: text.clone(),
+                kind: Some(CompletionItemKind::Value),
+                detail: Some("Balancing amount".to_string()),
+                filter_text: Some(text.clone()),
+                text_edit: Some(lsp_types::CompletionItemTextEdit::TextEdit(TextEdit {
+                    range: replace_range,
+                    new_text: text,
+                })),
+                ..Default::default()
+            }
+        })
+        .collect();
+    Ok(items)
+}
+
+/// Find the innermost `transaction` node enclosing `point`. Falls back to the
+/// nearest transaction whose body the cursor line extends, which handles a fresh
+/// posting line appended just below an otherwise-parsed transaction.
+fn enclosing_transaction(
+    tree: &tree_sitter::Tree,
+    point: tree_sitter::Point,
+) -> Option<tree_sitter::Node<'_>> {
+    let mut node = tree
+        .root_node()
+        .named_descendant_for_point_range(point, point)
+        .or_else(|| tree.root_node().descendant_for_point_range(point, point));
+    while let Some(n) = node {
+        if n.kind() == "transaction" {
+            return Some(n);
+        }
+        node = n.parent();
+    }
+
+    nearest_transaction_by_row(tree.root_node(), point.row)
+}
+
+/// Nearest `transaction` whose `[start_row, end_row + 1]` range contains `row`,
+/// preferring the latest-starting such transaction.
+fn nearest_transaction_by_row(
+    root: tree_sitter::Node<'_>,
+    row: usize,
+) -> Option<tree_sitter::Node<'_>> {
+    let mut best: Option<tree_sitter::Node> = None;
+    let mut walker = root.walk();
+    let mut stack: Vec<tree_sitter::Node> = root.children(&mut walker).collect();
+    while let Some(n) = stack.pop() {
+        if n.kind() == "transaction" {
+            let sr = n.start_position().row;
+            let er = n.end_position().row;
+            let better = best.is_none_or(|b| sr >= b.start_position().row);
+            if row >= sr && row <= er + 1 && better {
+                best = Some(n);
+            }
+        }
+        let mut w = n.walk();
+        for c in n.children(&mut w) {
+            stack.push(c);
+        }
+    }
+    best
+}
+
+/// The range covering the contiguous non-whitespace run ending at the cursor.
+/// Empty (`cursor..cursor`) when the character before the cursor is whitespace.
+fn current_amount_range(line: &str, position: Position) -> Range {
+    let chars: Vec<char> = line.chars().collect();
+    let col = (position.character as usize).min(chars.len());
+    let mut start = col;
+    while start > 0 && !chars[start - 1].is_whitespace() {
+        start -= 1;
+    }
+    Range::new(
+        Position::new(position.line, start as u32),
+        Position::new(position.line, col as u32),
+    )
 }
 
 /// Complete payee names
@@ -789,6 +894,69 @@ impl CompletionItemExt for CompletionItem {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parse(text: &str) -> (tree_sitter::Tree, ropey::Rope) {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_beancount::language())
+            .unwrap();
+        let tree = parser.parse(text, None).unwrap();
+        (tree, ropey::Rope::from_str(text))
+    }
+
+    /// Helper: extract the `new_text` from each completion item's text edit.
+    fn edit_texts(items: &[CompletionItem]) -> Vec<String> {
+        items
+            .iter()
+            .filter_map(|i| match &i.text_edit {
+                Some(lsp_types::CompletionItemTextEdit::TextEdit(e)) => Some(e.new_text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_complete_amount_suggests_balancing_amount() {
+        let text =
+            "2026-01-06 * \"grocer\" \"\"\n  Assets:Checking  -100.00 USD\n  Expenses:Food  \n";
+        let (tree, rope) = parse(text);
+        // Cursor in the amount slot of the second posting (after trailing spaces).
+        let pos = Position::new(2, "  Expenses:Food  ".chars().count() as u32);
+        let items = complete_amount(&tree, &rope, pos).unwrap();
+        assert_eq!(edit_texts(&items), vec!["100.00 USD".to_string()]);
+    }
+
+    #[test]
+    fn test_complete_amount_empty_when_nothing_to_infer() {
+        // Only one posting, no explicit amount anywhere => nothing to balance.
+        let text = "2026-01-06 * \"x\" \"\"\n  Assets:Checking  \n";
+        let (tree, rope) = parse(text);
+        let pos = Position::new(1, "  Assets:Checking  ".chars().count() as u32);
+        assert!(complete_amount(&tree, &rope, pos).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_current_amount_range_empty_in_whitespace() {
+        // Cursor sits after trailing whitespace => zero-width insert range.
+        let line = "  Expenses:Food  ";
+        let pos = Position::new(2, line.chars().count() as u32);
+        let r = current_amount_range(line, pos);
+        assert_eq!(r.start, r.end);
+        assert_eq!(r.start, pos);
+    }
+
+    #[test]
+    fn test_current_amount_range_covers_partial_number() {
+        // Cursor after a partially typed number => range covers that run.
+        let line = "  Expenses:Food  -10";
+        let pos = Position::new(2, line.chars().count() as u32);
+        let r = current_amount_range(line, pos);
+        assert_eq!(
+            r.start,
+            Position::new(2, "  Expenses:Food  ".chars().count() as u32)
+        );
+        assert_eq!(r.end, pos);
+    }
 
     #[test]
     fn test_score_account_exact_match() {
