@@ -163,12 +163,31 @@ fn byte_to_tree_sitter_point(
     Ok(tree_sitter::Point::new(row, column))
 }
 
+/// Text of `node` as it reads in `source`.
+///
+/// `source` is expected to be the very text `node`'s tree was parsed from. If it
+/// is not, the node's byte range can fall outside the rope, so the range is
+/// clamped rather than indexed blindly: `Rope::byte_to_char` panics out of
+/// bounds, and this is called from provider threads whose panic aborts the
+/// server. A mismatch is a bug in whoever paired the two — it is logged here and
+/// fixed there (see `DocumentStore::skip_if_open`).
 pub fn text_for_tree_sitter_node(
     source: &ropey::Rope,
     node: &tree_sitter::Node,
 ) -> std::string::String {
-    let start = source.byte_to_char(node.start_byte());
-    let end = source.byte_to_char(node.end_byte());
+    let len_bytes = source.len_bytes();
+    let start_byte = node.start_byte().min(len_bytes);
+    let end_byte = node.end_byte().min(len_bytes).max(start_byte);
+    if start_byte != node.start_byte() || end_byte != node.end_byte() {
+        tracing::warn!(
+            "node byte range {}..{} is outside its source ({} bytes); tree and text disagree",
+            node.start_byte(),
+            node.end_byte(),
+            len_bytes,
+        );
+    }
+    let start = source.byte_to_char(start_byte);
+    let end = source.byte_to_char(end_byte);
     let slice = source.slice(start..end);
     slice.into()
 }
@@ -477,5 +496,22 @@ mod tests {
             result.is_ok(),
             "Should handle out-of-bounds range gracefully"
         );
+    }
+
+    #[test]
+    fn test_text_for_node_clamps_a_range_past_the_end_of_the_source() {
+        let long = "2024-01-01 open Assets:Checking USD\n2024-01-02 open Assets:Savings USD\n";
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_beancount::language())
+            .expect("Failed to set language");
+        let tree = parser.parse(long, None).expect("Failed to parse");
+
+        // A rope holding less text than the tree was parsed from: the editor's
+        // unsaved buffer against a tree parsed from the file on disk.
+        let short = Rope::from_str("2024-01-01 open Assets:Checking USD\n");
+        let text = text_for_tree_sitter_node(&short, &tree.root_node());
+
+        assert_eq!(text, short.to_string());
     }
 }
