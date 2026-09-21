@@ -68,11 +68,13 @@ async function start_or_restart_client(
     journal_file?: string;
     formatting?: unknown;
     bean_check?: unknown;
+    document_symbols?: string;
   };
 
   const initializationOptions: InitializationOptions = {
     formatting: config.get("formatting"),
     bean_check: config.get("beanCheck"),
+    document_symbols: config.get<string>("documentSymbols"),
   };
 
   const journalFile = config.get<string>("journalFile");
