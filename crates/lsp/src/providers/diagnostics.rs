@@ -19,6 +19,7 @@ pub trait DiagnosticSource {
 pub struct CheckerDiagnosticSource<'a> {
     pub checker: &'a dyn BeancountChecker,
     pub root_journal_file: &'a Path,
+    pub diagnostic_flags: &'a [String],
 }
 
 /// Diagnostics produced by scanning flagged entries in parsed beancount data.
@@ -29,7 +30,7 @@ pub struct FlaggedEntryDiagnosticSource<'a> {
 
 impl DiagnosticSource for CheckerDiagnosticSource<'_> {
     fn collect(&self) -> HashMap<PathBuf, Vec<lsp_types::Diagnostic>> {
-        checker_diagnostics(self.checker, self.root_journal_file)
+        checker_diagnostics(self.checker, self.root_journal_file, self.diagnostic_flags)
     }
 }
 
@@ -79,6 +80,7 @@ pub fn diagnostics(
         &CheckerDiagnosticSource {
             checker,
             root_journal_file,
+            diagnostic_flags,
         },
         &FlaggedEntryDiagnosticSource {
             beancount_data,
@@ -104,9 +106,16 @@ fn merge_maps(
 }
 
 /// Run bean-check and return its diagnostics, or fall back to empty on failure.
+///
+/// `diagnostic_flags` gates the checker's flagged-entry warnings: the embedded
+/// `bean_check.py` only ever emits `!`-flagged transactions, so they are included
+/// only when `"!"` is among the configured flags. Without this gate, setting
+/// `diagnosticFlags` to `[]` (or any list without `"!"`) fails to suppress them —
+/// the parsed-data source already self-filters, but this one did not.
 pub fn checker_diagnostics(
     checker: &dyn BeancountChecker,
     root_journal_file: &Path,
+    diagnostic_flags: &[String],
 ) -> HashMap<PathBuf, Vec<lsp_types::Diagnostic>> {
     tracing::debug!("Using checker: {}", checker.name());
     tracing::debug!(
@@ -137,7 +146,11 @@ pub fn checker_diagnostics(
     };
 
     let mut map = convert_errors_to_diagnostics(check_result.errors);
-    merge_flagged_entries_from_checker(&mut map, check_result.flagged_entries);
+    // The checker's flagged entries are all "!" (see bean_check.py); only surface
+    // them when "!" is enabled in diagnostic_flags.
+    if diagnostic_flags.iter().any(|f| f == "!") {
+        merge_flagged_entries_from_checker(&mut map, check_result.flagged_entries);
+    }
     map
 }
 
@@ -754,9 +767,48 @@ mod tests {
         let source = CheckerDiagnosticSource {
             checker: &checker,
             root_journal_file: &file_path,
+            diagnostic_flags: &["!".to_string()],
         };
         let checker_result = source.collect();
         // /bin/true succeeds with no output → empty map
         assert!(checker_result.is_empty());
+    }
+
+    #[test]
+    fn test_checker_flagged_entries_respect_diagnostic_flags() {
+        use crate::checkers::BeancountCheckResult;
+
+        // A checker that always returns one "!"-style flagged entry.
+        struct FlaggedChecker;
+        impl BeancountChecker for FlaggedChecker {
+            fn check(&self, _: &Path) -> anyhow::Result<BeancountCheckResult> {
+                Ok(BeancountCheckResult::with_flagged_entries(vec![
+                    FlaggedEntry::new(PathBuf::from("/x.beancount"), 10, "Flagged Entry".into()),
+                ]))
+            }
+            fn name(&self) -> &'static str {
+                "FlaggedMock"
+            }
+            fn is_available(&self) -> bool {
+                true
+            }
+        }
+
+        let checker = FlaggedChecker;
+        let root = PathBuf::from("/x.beancount");
+
+        let count = |flags: &[String]| -> usize {
+            checker_diagnostics(&checker, &root, flags)
+                .values()
+                .map(|v| v.len())
+                .sum()
+        };
+
+        // "!" enabled => the flagged entry is surfaced.
+        assert_eq!(count(&["!".to_string()]), 1);
+        // Empty list => suppressed (the regression this fixes).
+        assert_eq!(count(&[]), 0);
+        // A list without "!" => also suppressed.
+        assert_eq!(count(&["P".to_string()]), 0);
     }
 }

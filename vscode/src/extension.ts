@@ -68,11 +68,16 @@ async function start_or_restart_client(
     journal_file?: string;
     formatting?: unknown;
     bean_check?: unknown;
+    diagnostic_flags?: string[];
   };
 
   const initializationOptions: InitializationOptions = {
     formatting: config.get("formatting"),
     bean_check: config.get("beanCheck"),
+    // The server expects snake_case `diagnostic_flags`; the VSCode setting is
+    // `beancountLangServer.diagnosticFlags`. Without this the server falls back
+    // to its default ["!"] and ignores the user's setting (e.g. [] to disable).
+    diagnostic_flags: config.get<string[]>("diagnosticFlags"),
   };
 
   const journalFile = config.get<string>("journalFile");

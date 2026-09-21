@@ -151,6 +151,15 @@
             }
           }
         },
+        "beancountLangServer.diagnosticFlags": {
+          "scope": "resource",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": ["!"],
+          "description": "List of transaction flags that should generate warning diagnostics (e.g., [\"!\", \"P\"]). Set to [] to disable."
+        },
         "beancountLangServer.serverPath": {
           "scope": "resource",
           "type": "string",
